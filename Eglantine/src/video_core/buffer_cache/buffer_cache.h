@@ -38,6 +38,10 @@
 
 namespace VideoCommon {
 
+// The most one staging buffer holds for a synchronous buffer download (DownloadBufferMemory,
+// DownloadBuffersMemory): larger transfers go in batches, each its own buffer.
+inline constexpr u64 DownloadBatchBytes = u64{32} << 20;
+
 using Core::DEVICE_PAGESIZE;
 
 template <class P>
@@ -4094,15 +4098,6 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
         return;
     }
     const StutterTrace::SiteScope site{StutterTrace::Site::BufferDownload};
-    auto download_staging = runtime.DownloadStagingBuffer(total_size_bytes);
-    for (Download& download : downloads) {
-        download.copy.dst_offset += download_staging.offset;
-        Buffer& buffer = slot_buffers[download.buffer_id];
-        buffer.MarkUsage(download.copy.src_offset, download.copy.size);
-        runtime.CopyBuffer(download_staging.buffer, buffer, std::span{&download.copy, 1}, true);
-    }
-    runtime.Finish();
-    const u8* const mapped_memory = download_staging.mapped_span.data();
     DAddr landing_begin = ~DAddr{0};
     DAddr landing_end = 0;
     for (const Download& download : downloads) {
@@ -4110,14 +4105,51 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
         landing_begin = (std::min)(landing_begin, address);
         landing_end = (std::max)(landing_end, address + download.copy.size);
     }
-    const VideoCore::DownloadLanding landing{landing_begin, landing_end};
-    const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
+    // In staging batches of at most DownloadBatchBytes: one buffer for the whole transfer needed a
+    // contiguous block the shared pool no longer had (OoT on a standard PS5: a 288 MiB download
+    // refused with 1-4 MiB the largest free block, then a crash).
+    std::vector<Download> pieces;
+    pieces.reserve(downloads.size());
     for (const Download& download : downloads) {
-        const DAddr device_addr = slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset;
-        WriteDownloadedMemory(
-            cpu_written, device_addr,
-            mapped_memory + (download.copy.dst_offset - download_staging.offset),
-            download.copy.size);
+        for (u64 done = 0; done < download.copy.size; done += DownloadBatchBytes) {
+            pieces.push_back({download.buffer_id,
+                              BufferCopy{
+                                  .src_offset = download.copy.src_offset + done,
+                                  .dst_offset = 0,
+                                  .size = (std::min)(DownloadBatchBytes, download.copy.size - done),
+                              }});
+        }
+    }
+    for (size_t first = 0; first < pieces.size();) {
+        u64 batch_bytes = 0;
+        size_t last = first;
+        while (last < pieces.size() &&
+               (last == first ||
+                batch_bytes + Common::AlignUp(pieces[last].copy.size, 64) <= DownloadBatchBytes)) {
+            pieces[last].copy.dst_offset = batch_bytes;
+            batch_bytes += Common::AlignUp(pieces[last].copy.size, 64);
+            ++last;
+        }
+        auto download_staging = runtime.DownloadStagingBuffer(batch_bytes);
+        for (size_t index = first; index < last; ++index) {
+            Download& piece = pieces[index];
+            piece.copy.dst_offset += download_staging.offset;
+            Buffer& buffer = slot_buffers[piece.buffer_id];
+            buffer.MarkUsage(piece.copy.src_offset, piece.copy.size);
+            runtime.CopyBuffer(download_staging.buffer, buffer, std::span{&piece.copy, 1}, true);
+        }
+        runtime.Finish();
+        const u8* const mapped_memory = download_staging.mapped_span.data();
+        const VideoCore::DownloadLanding landing{landing_begin, landing_end};
+        const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
+        for (size_t index = first; index < last; ++index) {
+            const Download& piece = pieces[index];
+            const DAddr device_addr = slot_buffers[piece.buffer_id].CpuAddr() + piece.copy.src_offset;
+            WriteDownloadedMemory(cpu_written, device_addr,
+                                  mapped_memory + (piece.copy.dst_offset - download_staging.offset),
+                                  piece.copy.size);
+        }
+        first = last;
     }
 }
 
@@ -4174,24 +4206,47 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
         }
     }
     if constexpr (USE_MEMORY_MAPS) {
-        auto download_staging = runtime.DownloadStagingBuffer(total_size_bytes);
-        const u8* const mapped_memory = download_staging.mapped_span.data();
-        const std::span<BufferCopy> copies_span(copies.data(), copies.data() + copies.size());
-        for (BufferCopy& copy : copies) {
-            // Modify copies to have the staging offset in mind
-            copy.dst_offset += download_staging.offset;
-            buffer.MarkUsage(copy.src_offset, copy.size);
-        }
-        runtime.CopyBuffer(download_staging.buffer, buffer, copies_span, true);
-        runtime.Finish();
-        const VideoCore::DownloadLanding landing{landing_begin, landing_end};
-        const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
+        // In staging batches of at most DownloadBatchBytes (see DownloadBuffersMemory).
+        boost::container::small_vector<BufferCopy, 4> pieces;
         for (const BufferCopy& copy : copies) {
-            const DAddr copy_device_addr = buffer.CpuAddr() + copy.src_offset;
-            // Undo the modified offset
-            const u64 dst_offset = copy.dst_offset - download_staging.offset;
-            const u8* copy_mapped_memory = mapped_memory + dst_offset;
-            WriteDownloadedMemory(cpu_written, copy_device_addr, copy_mapped_memory, copy.size);
+            for (u64 done = 0; done < copy.size; done += DownloadBatchBytes) {
+                pieces.push_back(BufferCopy{
+                    .src_offset = copy.src_offset + done,
+                    .dst_offset = 0,
+                    .size = (std::min)(DownloadBatchBytes, copy.size - done),
+                });
+            }
+        }
+        for (size_t first = 0; first < pieces.size();) {
+            u64 batch_bytes = 0;
+            size_t last = first;
+            while (last < pieces.size() &&
+                   (last == first ||
+                    batch_bytes + Common::AlignUp(pieces[last].size, 64) <= DownloadBatchBytes)) {
+                pieces[last].dst_offset = batch_bytes;
+                batch_bytes += Common::AlignUp(pieces[last].size, 64);
+                ++last;
+            }
+            auto download_staging = runtime.DownloadStagingBuffer(batch_bytes);
+            const u8* const mapped_memory = download_staging.mapped_span.data();
+            const std::span<BufferCopy> batch(pieces.data() + first, last - first);
+            for (BufferCopy& copy : batch) {
+                // Modify copies to have the staging offset in mind
+                copy.dst_offset += download_staging.offset;
+                buffer.MarkUsage(copy.src_offset, copy.size);
+            }
+            runtime.CopyBuffer(download_staging.buffer, buffer, batch, true);
+            runtime.Finish();
+            const VideoCore::DownloadLanding landing{landing_begin, landing_end};
+            const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
+            for (const BufferCopy& copy : batch) {
+                const DAddr copy_device_addr = buffer.CpuAddr() + copy.src_offset;
+                // Undo the modified offset
+                const u64 dst_offset = copy.dst_offset - download_staging.offset;
+                WriteDownloadedMemory(cpu_written, copy_device_addr, mapped_memory + dst_offset,
+                                      copy.size);
+            }
+            first = last;
         }
     } else {
         const std::span<u8> immediate_buffer = ImmediateBuffer(largest_copy);

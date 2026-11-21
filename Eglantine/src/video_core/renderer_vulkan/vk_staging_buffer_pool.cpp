@@ -128,7 +128,21 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
 
 StagingBufferPool::~StagingBufferPool() = default;
 
+// Its address, next to a caller's in the large-request line below, places the caller in the build's
+// ELF: caller - anchor + the anchor's ELF address.
+[[gnu::noinline]] static void StagingRequestAnchor() {}
+
 StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool deferred) {
+    // Requests of 64 MiB and more need that much contiguous memory in the shared pool: name the
+    // caller (OoT on a standard PS5: a 288 MiB download was refused, then the session crashed).
+    if (size >= (size_t{64} << 20)) {
+        static std::atomic<unsigned> large{0};
+        if (large.fetch_add(1, std::memory_order_relaxed) < 64) {
+            std::fprintf(stderr, "EDEN_STAGING_LARGE size=%zuMiB usage=%u deferred=%d caller=%p anchor=%p\n",
+                         size >> 20, unsigned(usage), int(deferred), __builtin_return_address(0),
+                         reinterpret_cast<void*>(&StagingRequestAnchor));
+        }
+    }
     if (!deferred && usage == MemoryUsage::Upload && size <= region_size) {
         return GetStreamBuffer(size);
     }
