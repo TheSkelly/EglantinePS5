@@ -154,6 +154,13 @@ void MarkSubresourcesWrittenWhole(const ImageBase& dst, const ImageBase& src,
 [[nodiscard]] boost::container::small_vector<SwizzleParameters, 16> FullUploadSwizzles(
     const ImageInfo& info);
 
+/// SwizzleImage for one block-linear copy that covers only the layers its image_subresource names
+/// (SwizzleImage always writes every layer of the copy's level). `memory` starts at the copy's first
+/// layer at copy.buffer_offset.
+void SwizzleImageLayers(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
+                        const BufferImageCopy& copy, std::span<const u8> memory,
+                        Common::ScratchBuffer<u8>& tmp_buffer);
+
 void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
                   std::span<const BufferImageCopy> copies, std::span<const u8> memory,
                   Common::ScratchBuffer<u8>& tmp_buffer);

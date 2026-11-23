@@ -1524,6 +1524,64 @@ boost::container::small_vector<SwizzleParameters, 16> FullUploadSwizzles(const I
     return params;
 }
 
+void SwizzleImageLayers(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
+                        const BufferImageCopy& copy, std::span<const u8> memory,
+                        Common::ScratchBuffer<u8>& tmp_buffer) {
+    ASSERT(info.type != ImageType::Linear);
+    const u32 host_levels =
+        info.num_samples > 1
+            ? 1
+            : HostMipLevelCount(info.size.width, info.size.height, info.size.depth,
+                                static_cast<u32>(info.resources.levels));
+    if (!IsHostMipLevel(copy.image_subresource.base_level, host_levels)) {
+        // The host did not download this tail level. Preserve the guest bytes.
+        return;
+    }
+    const Extent3D size = info.size;
+    const LevelInfo level_info = MakeLevelInfo(info);
+    const Extent2D tile_size = DefaultBlockSize(info.format);
+    const u32 bytes_per_block = BytesPerBlock(info.format);
+
+    const s32 level = copy.image_subresource.base_level;
+    const Extent3D level_size = AdjustMipSize(size, level);
+    const u32 host_bytes_per_layer = NumBlocks(level_size, tile_size) * bytes_per_block;
+
+    UNIMPLEMENTED_IF(copy.image_offset.x != 0);
+    UNIMPLEMENTED_IF(copy.image_offset.y != 0);
+    UNIMPLEMENTED_IF(copy.image_offset.z != 0);
+    UNIMPLEMENTED_IF(copy.image_extent != level_size);
+
+    const Extent3D num_tiles = AdjustTileSize(level_size, tile_size);
+    const Extent3D block =
+        AdjustMipBlockSize(num_tiles, level_info.block, level, level_info.num_levels);
+
+    const u32 num_levels = info.resources.levels;
+    const std::array sizes = CalculateLevelSizes(level_info, num_levels);
+    const size_t layer_stride =
+        AlignLayerSize(CalculateLevelBytes(sizes, num_levels), size, level_info.block,
+                       tile_size.height, info.tile_width_spacing);
+    const size_t subresource_size = sizes[level];
+
+    const s32 first_layer = copy.image_subresource.base_layer;
+    const s32 end_layer = (std::min)(first_layer + copy.image_subresource.num_layers,
+                                     info.resources.layers);
+    size_t host_offset = copy.buffer_offset;
+    size_t guest_offset = CalculateLevelBytes(sizes, level) + layer_stride * static_cast<size_t>(first_layer);
+    for (s32 layer = first_layer; layer < end_layer; ++layer) {
+        const std::span<const u8> src = memory.subspan(host_offset);
+        {
+            Tegra::Memory::GpuGuestMemoryScoped<u8,
+                                                Tegra::Memory::GuestMemoryFlags::UnsafeReadWrite>
+                dst(gpu_memory, gpu_addr + guest_offset, subresource_size, &tmp_buffer);
+
+            SwizzleTexture(dst, src, bytes_per_block, num_tiles.width, num_tiles.height,
+                           num_tiles.depth, block.height, block.depth, 1, gpu_memory.UsesNativeTiling());
+        }
+        host_offset += host_bytes_per_layer;
+        guest_offset += layer_stride;
+    }
+}
+
 void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
                   std::span<const BufferImageCopy> copies, std::span<const u8> memory,
                   Common::ScratchBuffer<u8>& tmp_buffer) {

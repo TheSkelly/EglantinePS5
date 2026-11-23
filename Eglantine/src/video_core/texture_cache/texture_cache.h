@@ -192,11 +192,42 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             return false;
         }
         if (must_download) {
-            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
             const auto copies = FullDownloadCopies(image.info);
-            image.DownloadMemory(map, copies);
-            runtime.Finish();
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
+            // A large image goes back in batches of whole layers, one level at a time: one staging
+            // buffer for all of it needed that much contiguous memory in the shared pool right when
+            // the collector runs because memory is short (OoT on a standard PS5: a 288 MiB download
+            // refused, then the session crashed).
+            constexpr u64 EvictDownloadBatchBytes = u64{32} << 20;
+            if (image.unswizzled_size_bytes <= EvictDownloadBatchBytes ||
+                image.info.type == ImageType::Linear || image.info.num_samples > 1) {
+                auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+                image.DownloadMemory(map, copies);
+                runtime.Finish();
+                SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span,
+                             swizzle_data_buffer);
+            } else {
+                for (const BufferImageCopy& level_copy : copies) {
+                    const s32 layers = level_copy.image_subresource.num_layers;
+                    const u64 layer_bytes = layers > 0 ? level_copy.buffer_size / static_cast<u64>(layers) : 0;
+                    if (layer_bytes == 0) {
+                        continue;
+                    }
+                    const s32 per_batch = static_cast<s32>(
+                        (std::max)(u64{1}, EvictDownloadBatchBytes / layer_bytes));
+                    for (s32 first = 0; first < layers; first += per_batch) {
+                        BufferImageCopy part = level_copy;
+                        part.buffer_offset = 0;
+                        part.image_subresource.base_layer = level_copy.image_subresource.base_layer + first;
+                        part.image_subresource.num_layers = (std::min)(per_batch, layers - first);
+                        part.buffer_size = layer_bytes * static_cast<u64>(part.image_subresource.num_layers);
+                        auto map = runtime.DownloadStagingBuffer(part.buffer_size);
+                        image.DownloadMemory(map, std::span{&part, 1});
+                        runtime.Finish();
+                        SwizzleImageLayers(*gpu_memory, image.gpu_addr, image.info, part,
+                                           map.mapped_span, swizzle_data_buffer);
+                    }
+                }
+            }
             ++gc_download_deletes;
             ClearStaleImage(image);
         } else {
